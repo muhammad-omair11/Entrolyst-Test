@@ -121,12 +121,17 @@ jobs:
           CONTAINER_NAME: "frontend-${{ needs.build.outputs.env }}"
           PRIVATE_KEY: /etc/imgcrypt/frontend_private.pem
         run: |
-          sudo nerdctl pull "$IMAGE"
+          # Pull the encrypted image WITHOUT unpacking (layers are still ciphertext)
+          sudo nerdctl pull --unpack=false "$IMAGE"
 
+          # Decrypt into a local plaintext image tag
           sudo nerdctl image decrypt \
             --key="$PRIVATE_KEY" \
             "$IMAGE" \
             "${IMAGE}-decrypted"
+
+          # Explicitly unpack the now-decrypted image so it's ready to run
+          sudo nerdctl image pull --unpack "${IMAGE}-decrypted" 2>/dev/null || true
 
           sudo nerdctl stop "$CONTAINER_NAME" || true
           sudo nerdctl rm "$CONTAINER_NAME" || true
