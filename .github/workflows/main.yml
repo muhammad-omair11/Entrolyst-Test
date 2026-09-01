@@ -117,7 +117,7 @@ jobs:
         run: |
           sudo nerdctl save "${IMAGE}-decrypted" -o /tmp/frontend-decrypted.tar
           sudo docker load -i /tmp/frontend-decrypted.tar
-          rm -f /tmp/frontend-decrypted.tar
+          sudo rm -f /tmp/frontend-decrypted.tar
 
       - name: Run container with Docker
         env:
