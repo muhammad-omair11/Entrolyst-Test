@@ -1,9 +1,9 @@
 name: CI/CD for Frontend
-
 on:
   push:
     branches:
       - main
+      - dev
   workflow_dispatch:
     inputs:
       environment:
@@ -16,76 +16,102 @@ on:
           - prod
 
 jobs:
-  build-and-deploy:
+  # -----------------------------------------------------------------
+  # 1. Build — build image locally, encrypt it, push encrypted to GHCR
+  # -----------------------------------------------------------------
+  build:
     runs-on: self-hosted
-    environment: ${{ github.event.inputs.environment || 'dev' }}
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      env: ${{ steps.vars.outputs.env }}
     steps:
-      # -----------------------------------------------------------------
-      # 1. Get the code
-      # -----------------------------------------------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------
-      # 2. Work out env name + image tag
-      # -----------------------------------------------------------------
       - name: Set environment info
         id: vars
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
           TAG="${ENV}-${GITHUB_SHA::7}"
           OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/frontend:${TAG}"
           echo "env=$ENV" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "owner=$OWNER" >> $GITHUB_OUTPUT
-          echo "Deploying environment: $ENV  |  image tag: $TAG"
-
-      # -----------------------------------------------------------------
-      # 3. Log in to GitHub Container Registry (same account, both envs)
-      # -----------------------------------------------------------------
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "Deploying environment: $ENV | image tag: $TAG"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # -----------------------------------------------------------------
-      # 4. Build & push the image (CI)
-      # -----------------------------------------------------------------
-      - name: Build and push image
+      - name: Build image locally (no push)
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          tags: |
-            ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.tag }}
-            ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+          push: false
+          load: true
+          tags: local/frontend:build
 
-      # -----------------------------------------------------------------
-      # 5. Deploy locally — runner lives on the same VM, no SSH needed
-      # -----------------------------------------------------------------
+      - name: Write public key
+        run: echo "${{ secrets.ENC_PUBLIC_KEY }}" > pubkey.pem
+
+      - name: Log in to GHCR (skopeo)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Encrypt and push image
+        run: |
+          skopeo copy \
+            --encryption-key jwe:pubkey.pem \
+            docker-daemon:local/frontend:build \
+            docker://${{ steps.vars.outputs.image }}
+
+          skopeo copy \
+            --encryption-key jwe:pubkey.pem \
+            docker-daemon:local/frontend:build \
+            docker://ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+
+      - name: Clean up key
+        if: always()
+        run: rm -f pubkey.pem
+
+  # -----------------------------------------------------------------
+  # 2. Deploy — pull encrypted image, decrypt with private key, run
+  # -----------------------------------------------------------------
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    environment: ${{ needs.build.outputs.env }}
+    steps:
+      - name: Log in to GHCR (nerdctl)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo nerdctl login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Deploy on this VM
         env:
-          IMAGE: ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.tag }}
+          IMAGE: ${{ needs.build.outputs.image }}
           TARGET_PORT: ${{ secrets.VM_PORT }}
-          CONTAINER_NAME: "frontend-${{ steps.vars.outputs.env }}"
+          CONTAINER_NAME: "frontend-${{ needs.build.outputs.env }}"
+          PRIVATE_KEY: /etc/imgcrypt/frontend_private.pem
         run: |
-          docker pull $IMAGE
-          docker stop $CONTAINER_NAME || true
-          docker rm $CONTAINER_NAME || true
-          docker run -d \
-            --name $CONTAINER_NAME \
+          # Pull the encrypted image (stored encrypted, not runnable yet)
+          sudo nerdctl pull "$IMAGE"
+
+          # Decrypt into a local plaintext image tag
+          sudo nerdctl image decrypt \
+            --key="$PRIVATE_KEY" \
+            "$IMAGE" \
+            "${IMAGE}-decrypted"
+
+          sudo nerdctl stop "$CONTAINER_NAME" || true
+          sudo nerdctl rm "$CONTAINER_NAME" || true
+
+          sudo nerdctl run -d \
+            --name "$CONTAINER_NAME" \
             --restart unless-stopped \
-            -p $TARGET_PORT:80 \
-            $IMAGE
+            -p "$TARGET_PORT:80" \
+            "${IMAGE}-decrypted"
 
       - name: Deployment summary
-        run: |
-          echo "✅ Deployed ${{ steps.vars.outputs.tag }} to ${{ steps.vars.outputs.env }}"
+        run: echo "✅ Deployed ${{ needs.build.outputs.image }} to ${{ needs.build.outputs.env }}"
