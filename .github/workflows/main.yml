@@ -21,6 +21,7 @@ jobs:
   # -----------------------------------------------------------------
   build:
     runs-on: self-hosted
+    environment: ${{ github.event.inputs.environment || 'dev' }}
     permissions:
       contents: read
       packages: write
@@ -61,7 +62,6 @@ jobs:
         run: |
           if [ -z "$SECRET" ]; then
             echo "❌ ENC_PUBLIC_KEY is EMPTY or not accessible to this job"
-            echo "This job has no 'environment:' set — check that the secret is a REPOSITORY secret, not an environment-scoped one."
             exit 1
           else
             echo "✅ ENC_PUBLIC_KEY has content, length: ${#SECRET}"
