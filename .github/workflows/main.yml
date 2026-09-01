@@ -56,12 +56,26 @@ jobs:
           tags: local/frontend:build
 
       - name: Write public key
-        run: echo "${{ secrets.ENC_PUBLIC_KEY }}" > pubkey.pem
+        run: |
+          printf '%s' "${{ secrets.ENC_PUBLIC_KEY }}" | base64 -d > pubkey.pem
+
+      - name: Debug key file (remove once confirmed working)
+        run: |
+          file pubkey.pem
+          wc -c pubkey.pem
+          head -1 pubkey.pem
+          tail -1 pubkey.pem
+          openssl rsa -pubin -in pubkey.pem -noout -text | head -3
+          skopeo --version
 
       - name: Log in to GHCR (skopeo)
+        env:
+          REGISTRY_AUTH_FILE: ${{ github.workspace }}/auth.json
         run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Encrypt and push image
+        env:
+          REGISTRY_AUTH_FILE: ${{ github.workspace }}/auth.json
         run: |
           skopeo copy \
             --encryption-key jwe:pubkey.pem \
@@ -73,9 +87,9 @@ jobs:
             docker-daemon:local/frontend:build \
             docker://ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
 
-      - name: Clean up key
+      - name: Clean up key and auth file
         if: always()
-        run: rm -f pubkey.pem
+        run: rm -f pubkey.pem ${{ github.workspace }}/auth.json
 
   # -----------------------------------------------------------------
   # 2. Deploy — pull encrypted image, decrypt with private key, run
