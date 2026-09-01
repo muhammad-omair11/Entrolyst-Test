@@ -17,7 +17,7 @@ on:
 
 jobs:
   # -----------------------------------------------------------------
-  # 1. Build — build + encrypt with nerdctl, push encrypted to GHCR
+  # 1. Build — build the image with Docker, tagged by commit SHA
   # -----------------------------------------------------------------
   build:
     runs-on: self-hosted
@@ -28,6 +28,8 @@ jobs:
     outputs:
       image: ${{ steps.vars.outputs.image }}
       env: ${{ steps.vars.outputs.env }}
+      owner: ${{ steps.vars.outputs.owner }}
+      local_tag: ${{ steps.vars.outputs.local_tag }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -36,17 +38,47 @@ jobs:
         id: vars
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
-          TAG="${ENV}-${GITHUB_SHA::7}"
+          SHA="${GITHUB_SHA::7}"
+          TAG="${ENV}-${SHA}"
           OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${OWNER}/frontend:${TAG}"
+          LOCAL_TAG="local/frontend:${SHA}"
           echo "env=$ENV" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "owner=$OWNER" >> $GITHUB_OUTPUT
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "local_tag=$LOCAL_TAG" >> $GITHUB_OUTPUT
 
-      - name: Build image with nerdctl
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image with Docker (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.vars.outputs.local_tag }}
+
+  # -----------------------------------------------------------------
+  # 2. Encrypt — hand Docker image to nerdctl, encrypt, push to GHCR
+  # -----------------------------------------------------------------
+  encrypt:
+    needs: build
+    runs-on: self-hosted
+    environment: ${{ needs.build.outputs.env }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Save Docker image and load into nerdctl
+        env:
+          LOCAL_TAG: ${{ needs.build.outputs.local_tag }}
         run: |
-          sudo nerdctl build -t local/frontend:build .
+          docker save "$LOCAL_TAG" -o /tmp/frontend-build.tar
+          sudo nerdctl load -i /tmp/frontend-build.tar
+          sudo rm -f /tmp/frontend-build.tar
 
       - name: Check secret is populated
         env:
@@ -66,31 +98,31 @@ jobs:
         run: |
           sudo nerdctl image encrypt \
             --recipient=jwe:pubkey.pem \
-            local/frontend:build \
-            ${{ steps.vars.outputs.image }}
+            ${{ needs.build.outputs.local_tag }} \
+            ${{ needs.build.outputs.image }}
 
           sudo nerdctl image encrypt \
             --recipient=jwe:pubkey.pem \
-            local/frontend:build \
-            ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+            ${{ needs.build.outputs.local_tag }} \
+            ghcr.io/${{ needs.build.outputs.owner }}/frontend:${{ needs.build.outputs.env }}-latest
 
       - name: Log in to GHCR (nerdctl)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo nerdctl login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push encrypted image
         run: |
-          sudo nerdctl push ${{ steps.vars.outputs.image }}
-          sudo nerdctl push ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+          sudo nerdctl push ${{ needs.build.outputs.image }}
+          sudo nerdctl push ghcr.io/${{ needs.build.outputs.owner }}/frontend:${{ needs.build.outputs.env }}-latest
 
       - name: Clean up key
         if: always()
         run: rm -f pubkey.pem
 
   # -----------------------------------------------------------------
-  # 2. Deploy — pull+decrypt with nerdctl, run with docker
+  # 3. Deploy — nerdctl pulls + decrypts, hands back to Docker to run
   # -----------------------------------------------------------------
   deploy:
-    needs: build
+    needs: [build, encrypt]
     runs-on: self-hosted
     environment: ${{ needs.build.outputs.env }}
     steps:
@@ -111,7 +143,7 @@ jobs:
             "$IMAGE" \
             "${IMAGE}-decrypted"
 
-      - name: Hand off decrypted image to Docker
+      - name: Hand decrypted image back to Docker
         env:
           IMAGE: ${{ needs.build.outputs.image }}
         run: |
@@ -135,4 +167,4 @@ jobs:
             "${IMAGE}-decrypted"
 
       - name: Deployment summary
-        run: echo "✅ Deployed ${{ needs.build.outputs.image }} to ${{ needs.build.outputs.env }} via Docker"
+        run: echo "✅ Deployed ${{ needs.build.outputs.image }} (sha ${{ needs.build.outputs.sha }}) to ${{ needs.build.outputs.env }} via Docker"
