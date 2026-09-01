@@ -55,6 +55,18 @@ jobs:
           load: true
           tags: local/frontend:build
 
+      - name: Check secret is populated
+        env:
+          SECRET: ${{ secrets.ENC_PUBLIC_KEY }}
+        run: |
+          if [ -z "$SECRET" ]; then
+            echo "❌ ENC_PUBLIC_KEY is EMPTY or not accessible to this job"
+            echo "This job has no 'environment:' set — check that the secret is a REPOSITORY secret, not an environment-scoped one."
+            exit 1
+          else
+            echo "✅ ENC_PUBLIC_KEY has content, length: ${#SECRET}"
+          fi
+
       - name: Write public key
         run: |
           printf '%s' "${{ secrets.ENC_PUBLIC_KEY }}" | base64 -d > pubkey.pem
@@ -109,10 +121,8 @@ jobs:
           CONTAINER_NAME: "frontend-${{ needs.build.outputs.env }}"
           PRIVATE_KEY: /etc/imgcrypt/frontend_private.pem
         run: |
-          # Pull the encrypted image (stored encrypted, not runnable yet)
           sudo nerdctl pull "$IMAGE"
 
-          # Decrypt into a local plaintext image tag
           sudo nerdctl image decrypt \
             --key="$PRIVATE_KEY" \
             "$IMAGE" \
