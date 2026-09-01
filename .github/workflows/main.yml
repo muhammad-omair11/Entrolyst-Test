@@ -17,7 +17,7 @@ on:
 
 jobs:
   # -----------------------------------------------------------------
-  # 1. Build — build image locally, encrypt it, push encrypted to GHCR
+  # 1. Build — build + encrypt with nerdctl, push encrypted to GHCR
   # -----------------------------------------------------------------
   build:
     runs-on: self-hosted
@@ -43,18 +43,10 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "owner=$OWNER" >> $GITHUB_OUTPUT
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
-          echo "Deploying environment: $ENV | image tag: $TAG"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build image locally (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          load: true
-          tags: local/frontend:build
+      - name: Build image with nerdctl
+        run: |
+          sudo nerdctl build -t local/frontend:build .
 
       - name: Check secret is populated
         env:
@@ -63,48 +55,39 @@ jobs:
           if [ -z "$SECRET" ]; then
             echo "❌ ENC_PUBLIC_KEY is EMPTY or not accessible to this job"
             exit 1
-          else
-            echo "✅ ENC_PUBLIC_KEY has content, length: ${#SECRET}"
           fi
 
       - name: Write public key
         run: |
           printf '%s' "${{ secrets.ENC_PUBLIC_KEY }}" | base64 -d > pubkey.pem
-
-      - name: Debug key file (remove once confirmed working)
-        run: |
-          file pubkey.pem
-          wc -c pubkey.pem
           head -1 pubkey.pem
-          tail -1 pubkey.pem
-          openssl rsa -pubin -in pubkey.pem -noout -text | head -3
-          skopeo --version
 
-      - name: Log in to GHCR (skopeo)
-        env:
-          REGISTRY_AUTH_FILE: ${{ github.workspace }}/auth.json
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Encrypt and push image
-        env:
-          REGISTRY_AUTH_FILE: ${{ github.workspace }}/auth.json
+      - name: Encrypt image with nerdctl
         run: |
-          skopeo copy \
-            --encryption-key jwe:pubkey.pem \
-            docker-daemon:local/frontend:build \
-            docker://${{ steps.vars.outputs.image }}
+          sudo nerdctl image encrypt \
+            --recipient=jwe:pubkey.pem \
+            local/frontend:build \
+            ${{ steps.vars.outputs.image }}
 
-          skopeo copy \
-            --encryption-key jwe:pubkey.pem \
-            docker-daemon:local/frontend:build \
-            docker://ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+          sudo nerdctl image encrypt \
+            --recipient=jwe:pubkey.pem \
+            local/frontend:build \
+            ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
 
-      - name: Clean up key and auth file
+      - name: Log in to GHCR (nerdctl)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo nerdctl login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push encrypted image
+        run: |
+          sudo nerdctl push ${{ steps.vars.outputs.image }}
+          sudo nerdctl push ghcr.io/${{ steps.vars.outputs.owner }}/frontend:${{ steps.vars.outputs.env }}-latest
+
+      - name: Clean up key
         if: always()
-        run: rm -f pubkey.pem ${{ github.workspace }}/auth.json
+        run: rm -f pubkey.pem
 
   # -----------------------------------------------------------------
-  # 2. Deploy — pull encrypted image, decrypt with private key, run
+  # 2. Deploy — pull+decrypt with nerdctl, run with docker
   # -----------------------------------------------------------------
   deploy:
     needs: build
@@ -114,14 +97,12 @@ jobs:
       - name: Log in to GHCR (nerdctl)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo nerdctl login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Deploy on this VM
+      - name: Pull and decrypt with nerdctl
         env:
           IMAGE: ${{ needs.build.outputs.image }}
-          TARGET_PORT: ${{ secrets.VM_PORT }}
-          CONTAINER_NAME: "frontend-${{ needs.build.outputs.env }}"
           PRIVATE_KEY: /etc/imgcrypt/frontend_private.pem
         run: |
-          # Pull the encrypted image WITHOUT unpacking (layers are still ciphertext)
+          # Pull encrypted image WITHOUT unpacking (still ciphertext)
           sudo nerdctl pull --unpack=false "$IMAGE"
 
           # Decrypt into a local plaintext image tag
@@ -130,17 +111,28 @@ jobs:
             "$IMAGE" \
             "${IMAGE}-decrypted"
 
-          # Explicitly unpack the now-decrypted image so it's ready to run
-          sudo nerdctl image pull --unpack "${IMAGE}-decrypted" 2>/dev/null || true
+      - name: Hand off decrypted image to Docker
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          sudo nerdctl save "${IMAGE}-decrypted" -o /tmp/frontend-decrypted.tar
+          sudo docker load -i /tmp/frontend-decrypted.tar
+          rm -f /tmp/frontend-decrypted.tar
 
-          sudo nerdctl stop "$CONTAINER_NAME" || true
-          sudo nerdctl rm "$CONTAINER_NAME" || true
+      - name: Run container with Docker
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          TARGET_PORT: ${{ secrets.VM_PORT }}
+          CONTAINER_NAME: "frontend-${{ needs.build.outputs.env }}"
+        run: |
+          sudo docker stop "$CONTAINER_NAME" || true
+          sudo docker rm "$CONTAINER_NAME" || true
 
-          sudo nerdctl run -d \
+          sudo docker run -d \
             --name "$CONTAINER_NAME" \
             --restart unless-stopped \
             -p "$TARGET_PORT:80" \
             "${IMAGE}-decrypted"
 
       - name: Deployment summary
-        run: echo "✅ Deployed ${{ needs.build.outputs.image }} to ${{ needs.build.outputs.env }}"
+        run: echo "✅ Deployed ${{ needs.build.outputs.image }} to ${{ needs.build.outputs.env }} via Docker"
